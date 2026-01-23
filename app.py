@@ -27,7 +27,7 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-st.title("🧩 AI Fake Scene Image Classifier")
+st.title("🔍 AI Fake Scene Image Classifier")
 st.write("Upload an image to check whether it is **Fake** or **Real**")
 
 @st.cache_resource
