@@ -6,6 +6,7 @@ from huggingface_hub import hf_hub_download
 import cv2
 import tempfile
 import os
+import uuid
 
 from xai_occlusion import occlusion_xai
 from ocr.ocr_engine import OCREngine
@@ -15,7 +16,7 @@ from ocr.postprocess import clean_text
 # ------------------ PAGE CONFIG ------------------
 try:
     icon = Image.open("logo.png")
-except:
+except Exception:
     icon = "🧠"
 
 st.set_page_config(
@@ -40,16 +41,17 @@ st.write("Upload an image to check whether it is **Fake** or **Real**")
 
 
 # ------------------ LOAD MODELS ------------------
-@st.cache_resource
+@st.cache_resource(show_spinner=True)
 def load_model():
     model_path = hf_hub_download(
         repo_id="Tanishka024/fake-scene-classifier-model",
         filename="model.h5"
     )
-    return tf.keras.models.load_model(model_path)
+    # IMPORTANT: compile=False for inference safety
+    return tf.keras.models.load_model(model_path, compile=False)
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner=True)
 def load_ocr_engine():
     return OCREngine()
 
@@ -61,7 +63,8 @@ ocr_engine = load_ocr_engine()
 # ------------------ HELPERS ------------------
 def save_uploaded_image(uploaded_file):
     temp_dir = tempfile.gettempdir()
-    temp_path = os.path.join(temp_dir, uploaded_file.name)
+    unique_name = f"{uuid.uuid4()}_{uploaded_file.name}"
+    temp_path = os.path.join(temp_dir, unique_name)
 
     with open(temp_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
@@ -78,25 +81,34 @@ uploaded_file = st.file_uploader(
 
 # ------------------ MAIN PIPELINE ------------------
 if uploaded_file is not None:
-    image = Image.open(uploaded_file).convert("RGB")
+    try:
+        image = Image.open(uploaded_file).convert("RGB")
+    except Exception as e:
+        st.error("❌ Unable to read the image file")
+        st.stop()
+
     st.image(image, caption="Uploaded Image", use_column_width=True)
 
     # -------- CNN PREPROCESS --------
     image_resized = image.resize((224, 224))
-    img_xai = np.array(image_resized) / 255.0
+    img_xai = np.array(image_resized, dtype=np.float32) / 255.0
     img_array = np.expand_dims(img_xai, axis=0)
 
-    pred = model.predict(img_array)[0][0]
+    # -------- MODEL PREDICTION --------
+    pred = float(model.predict(img_array, verbose=0)[0][0])
 
     st.subheader("🧠 Prediction Result")
 
-    if pred >= 0.68:
+    REAL_THRESHOLD = 0.68
+    real_prob = pred
+
+    if real_prob >= REAL_THRESHOLD:
         predicted_label = "Real"
-        predicted_conf = pred
+        predicted_conf = real_prob
         st.success(f"✅ Real Image\nConfidence: {predicted_conf:.2f}")
     else:
         predicted_label = "Fake"
-        predicted_conf = 1 - pred
+        predicted_conf = 1 - real_prob
         st.error(f"❌ Fake Image\nConfidence: {predicted_conf:.2f}")
 
     # ------------------ OCR PIPELINE ------------------
@@ -110,7 +122,7 @@ if uploaded_file is not None:
             ocr_output = ocr_engine.extract(img_path)
             cleaned_text = clean_text(ocr_output)
 
-        if cleaned_text.strip():
+        if cleaned_text and cleaned_text.strip():
             st.success("Text detected in image")
 
             st.text_area(
@@ -119,7 +131,6 @@ if uploaded_file is not None:
                 height=220
             )
 
-            # -------- BASIC OCR HEURISTICS --------
             suspicious_words = [
                 "copy", "duplicate", "sample", "fake",
                 "edited", "photoshop"
@@ -156,35 +167,42 @@ if uploaded_file is not None:
 
         explained_img = (img_xai * 255).astype(np.uint8)
 
-        for r in regions:
-            x, y = r["x"], r["y"]
-            drop = r["drop"]
+        if regions:
+            for r in regions:
+                x, y = r["x"], r["y"]
+                drop = r["drop"]
 
-            cv2.rectangle(
-                explained_img,
-                (x, y),
-                (x + 32, y + 32),
-                (255, 0, 0),
-                2
-            )
+                cv2.rectangle(
+                    explained_img,
+                    (x, y),
+                    (x + 32, y + 32),
+                    (255, 0, 0),
+                    2
+                )
 
-            cv2.putText(
-                explained_img,
-                f"{drop:.2f}",
-                (x, y - 5),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.4,
-                (255, 0, 0),
-                1
-            )
+                cv2.putText(
+                    explained_img,
+                    f"{drop:.2f}",
+                    (x, max(y - 5, 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.4,
+                    (255, 0, 0),
+                    1
+                )
+
+            max_drop = regions[0]["drop"]
+        else:
+            max_drop = 0.0
+            st.warning("No influential regions found by occlusion analysis")
+
+        # Convert BGR → RGB for Streamlit
+        explained_img = cv2.cvtColor(explained_img, cv2.COLOR_BGR2RGB)
 
         st.image(
             explained_img,
             caption="Top Influential Regions (Occlusion-based XAI)",
             use_column_width=True
         )
-
-        max_drop = regions[0]["drop"] if regions else 0.0
 
         st.write(f"**Predicted Class:** {predicted_label}")
         st.write(f"**Prediction Confidence:** {predicted_conf:.2f}")
