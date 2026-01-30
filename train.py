@@ -56,6 +56,6 @@ model.fit(
     epochs=EPOCHS
 )
 
-model.save("model.h5")
+# model.save("model.h5")
 
 print("✅ Training finished. Model saved as model.h5")
