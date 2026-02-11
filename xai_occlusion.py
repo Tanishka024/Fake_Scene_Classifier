@@ -1,5 +1,4 @@
-import cv2
-import numpy as np  
+import numpy as np
 
 def occlusion_xai(
         model,
@@ -9,25 +8,29 @@ def occlusion_xai(
         top_k=5
 ):
     """
-    Occlusion-based XAI using sliding window + blur
+    Occlusion-based XAI using sliding window + mean masking
     Returns top-k most influential regions
     """
 
     h, w, _ = image.shape
 
-    image = image / 255.0
+    # image already normalized in app.py
+    original_pred = model.predict(
+        image[np.newaxis, ...],
+        verbose=0
+    )[0][0]
 
-    original_pred = model.predict(image[np.newaxis, ...], verbose=0)[0][0]
     results = []
 
     for y in range(0, h - window_size, stride):
         for x in range(0, w - window_size, stride):
 
             occluded_image = image.copy()
-
             patch = occluded_image[y:y+window_size, x:x+window_size]
-            blurred = cv2.GaussianBlur(patch, (15, 15), 0)
-            occluded_image[y:y+window_size, x:x+window_size] = blurred
+
+            # -------- CLEAN OCCLUSION (NO OPENCV) --------
+            patch_mean = patch.mean(axis=(0, 1), keepdims=True)
+            occluded_image[y:y+window_size, x:x+window_size] = patch_mean
 
             pred = model.predict(
                 occluded_image[np.newaxis, ...],

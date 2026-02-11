@@ -1,23 +1,7 @@
-from paddleocr import PaddleOCR
+import re
 
-class OCREngine:
-    def __init__(self):
-        self.model = PaddleOCR(
-            lang = 'en',
-            use_angle_cls = True
-        )
-    def extract(self,img_path):
-        result = self.model.ocr(img_path, cls = True)
-        ocr_data = []
-        for line in result[0]:
-        bbox = line[0]
-        text = line[1][0]
-        conf = line[1][1]
+def clean_text(ocr_data):
+    all_texts = " ".join([item["text"] for item in ocr_data])
 
-        ocr.append({
-            "bbox": bbox,
-            "text": text,
-            "confidence": conf
-        })
-        
-        return ocr_data
+    cleaned = re.sub(r'[^A-Za-z0-9.,:₹%-]', " ", all_texts)
+    return cleaned.lower()

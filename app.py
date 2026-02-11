@@ -1,19 +1,19 @@
 import streamlit as st
 import tensorflow as tf
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 from huggingface_hub import hf_hub_download
-import cv2
-import tempfile
 import os
-import uuid
+import sys
 
+from ocr_engine_simple import extract_text
+from field_extractor import extract_fields
+from risk_engine import calculate_risk_score
 from xai_occlusion import occlusion_xai
-from ocr.ocr_engine import OCREngine
-from ocr.postprocess import clean_text
 
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(ROOT_DIR)
 
-# ------------------ PAGE CONFIG ------------------
 try:
     icon = Image.open("logo.png")
 except Exception:
@@ -36,179 +36,176 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-st.title("🔍 AI Fake Scene Image Classifier")
-st.write("Upload an image to check whether it is **Fake** or **Real**")
+st.markdown("<h1>🔍 AI Fake Scene Image Classifier</h1>", unsafe_allow_html=True)
+st.markdown(
+    "<div style='font-size:1.1rem'>Upload an image to verify authenticity using AI-powered forensics</div>",
+    unsafe_allow_html=True
+)
 
+mode = st.radio(
+    "Select Analysis Type",
+    [
+        "📷 Normal Image (Photos / Scenes)",
+        "📄 Text-based Image (Payments / Documents)"
+    ]
+)
 
-# ------------------ LOAD MODELS ------------------
 @st.cache_resource(show_spinner=True)
 def load_model():
     model_path = hf_hub_download(
         repo_id="Tanishka024/fake-scene-classifier-model",
         filename="model.h5"
     )
-    # IMPORTANT: compile=False for inference safety
     return tf.keras.models.load_model(model_path, compile=False)
 
-
-@st.cache_resource(show_spinner=True)
-def load_ocr_engine():
-    return OCREngine()
-
-
 model = load_model()
-ocr_engine = load_ocr_engine()
 
+if mode == "📷 Normal Image (Photos / Scenes)":
 
-# ------------------ HELPERS ------------------
-def save_uploaded_image(uploaded_file):
-    temp_dir = tempfile.gettempdir()
-    unique_name = f"{uuid.uuid4()}_{uploaded_file.name}"
-    temp_path = os.path.join(temp_dir, unique_name)
+    uploaded_file = st.file_uploader(
+        "Upload a photo image",
+        type=["jpg", "jpeg", "png"]
+    )
 
-    with open(temp_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-
-    return temp_path
-
-
-# ------------------ FILE UPLOAD ------------------
-uploaded_file = st.file_uploader(
-    "Upload an image",
-    type=["jpg", "jpeg", "png"]
-)
-
-
-# ------------------ MAIN PIPELINE ------------------
-if uploaded_file is not None:
-    try:
+    if uploaded_file is not None:
         image = Image.open(uploaded_file).convert("RGB")
-    except Exception as e:
-        st.error("❌ Unable to read the image file")
-        st.stop()
+        st.image(image, caption="Uploaded Image", use_column_width=True)
 
-    st.image(image, caption="Uploaded Image", use_column_width=True)
+        image_resized = image.resize((224, 224))
+        img_xai = np.array(image_resized, dtype=np.float32) / 255.0
+        img_array = np.expand_dims(img_xai, axis=0)
 
-    # -------- CNN PREPROCESS --------
-    image_resized = image.resize((224, 224))
-    img_xai = np.array(image_resized, dtype=np.float32) / 255.0
-    img_array = np.expand_dims(img_xai, axis=0)
+        pred = float(model.predict(img_array, verbose=0)[0][0])
 
-    # -------- MODEL PREDICTION --------
-    pred = float(model.predict(img_array, verbose=0)[0][0])
+        extracted_text = extract_text(image)
+        text_lower = extracted_text.lower()
 
-    st.subheader("🧠 Prediction Result")
+        penalty = 0
 
-    REAL_THRESHOLD = 0.68
-    real_prob = pred
+        suspicious_words = [
+            "payment successful",
+            "upi",
+            "transaction id",
+            "thanks app",
+            "prepaid",
+            "bank reference",
+            "posting id"
+        ]
 
-    if real_prob >= REAL_THRESHOLD:
-        predicted_label = "Real"
-        predicted_conf = real_prob
-        st.success(f"✅ Real Image\nConfidence: {predicted_conf:.2f}")
-    else:
-        predicted_label = "Fake"
-        predicted_conf = 1 - real_prob
-        st.error(f"❌ Fake Image\nConfidence: {predicted_conf:.2f}")
+        for w in suspicious_words:
+            if w in text_lower:
+                penalty += 0.08
 
-    # ------------------ OCR PIPELINE ------------------
-    st.subheader("📄 OCR Analysis")
+        gray = np.array(image.convert("L"))
+        if np.std(gray) < 10:
+            penalty += 0.25
 
-    run_ocr = st.checkbox("Run OCR on this image")
+        final_score = pred - penalty
+        final_score = max(0, min(final_score, 1))
 
-    if run_ocr:
-        with st.spinner("Running OCR..."):
-            img_path = save_uploaded_image(uploaded_file)
-            ocr_output = ocr_engine.extract(img_path)
-            cleaned_text = clean_text(ocr_output)
+        st.subheader("🧠 Prediction Result")
 
-        if cleaned_text and cleaned_text.strip():
-            st.success("Text detected in image")
+        if final_score >= 0.70:
+            predicted_label = "Real"
+            predicted_conf = final_score
+            st.success(f"✅ Real Image\nConfidence: {predicted_conf:.2f}")
+        else:
+            predicted_label = "Fake"
+            predicted_conf = 1 - final_score
+            st.error(f"❌ Fake Image\nConfidence: {predicted_conf:.2f}")
 
-            st.text_area(
-                "Extracted Text",
-                cleaned_text,
-                height=220
+
+        explain = st.checkbox("🔍 Explain Prediction (Occlusion-based XAI)")
+
+        if explain:
+            regions, _ = occlusion_xai(
+                model=model,
+                image=img_xai,
+                window_size=32,
+                stride=16,
+                top_k=5
             )
 
-            suspicious_words = [
-                "copy", "duplicate", "sample", "fake",
-                "edited", "photoshop"
-            ]
+            explained_img = (img_xai * 255).astype(np.uint8)
+            pil_img = Image.fromarray(explained_img)
+            draw = ImageDraw.Draw(pil_img)
 
-            found_flags = [
-                w for w in suspicious_words
-                if w in cleaned_text.lower()
-            ]
+            if regions:
+                for r in regions:
+                    x, y = r["x"], r["y"]
+                    drop = r["drop"]
 
-            if found_flags:
-                st.error(
-                    f"⚠️ Suspicious keywords detected: {', '.join(found_flags)}"
-                )
+                    draw.rectangle(
+                        [(x, y), (x + 32, y + 32)],
+                        outline=(255, 0, 0),
+                        width=2
+                    )
+
+                    draw.text(
+                        (x, max(y - 10, 5)),
+                        f"{drop:.2f}",
+                        fill=(255, 0, 0)
+                    )
+
+                max_drop = regions[0]["drop"]
             else:
-                st.info("No obvious suspicious keywords detected")
+                max_drop = 0.0
 
-        else:
-            st.warning("No readable text detected in the image")
+            st.image(
+                np.array(pil_img),
+                caption="Top Influential Regions",
+                use_column_width=True
+            )
 
-    # ------------------ XAI EXPLANATION ------------------
-    explain = st.checkbox("🔍 Explain Prediction (Occlusion-based XAI)")
+            st.write(f"**Predicted Class:** {predicted_label}")
+            st.write(f"**Prediction Confidence:** {predicted_conf:.2f}")
+            st.write(f"**Maximum Confidence Drop:** {max_drop:.2f}")
 
-    if explain:
-        st.subheader("📌 Model Explanation")
+elif mode == "📄 Text-based Image (Payments / Documents)":
 
-        regions, original_conf = occlusion_xai(
-            model=model,
-            image=img_xai,
-            window_size=32,
-            stride=16,
-            top_k=5
-        )
+    st.markdown("### 📄 Document & Payment Screenshot Analysis")
 
-        explained_img = (img_xai * 255).astype(np.uint8)
+    uploaded_doc = st.file_uploader(
+        "Upload a payment screenshot or document image",
+        type=["jpg", "jpeg", "png"]
+    )
 
-        if regions:
-            for r in regions:
-                x, y = r["x"], r["y"]
-                drop = r["drop"]
-
-                cv2.rectangle(
-                    explained_img,
-                    (x, y),
-                    (x + 32, y + 32),
-                    (255, 0, 0),
-                    2
-                )
-
-                cv2.putText(
-                    explained_img,
-                    f"{drop:.2f}",
-                    (x, max(y - 5, 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.4,
-                    (255, 0, 0),
-                    1
-                )
-
-            max_drop = regions[0]["drop"]
-        else:
-            max_drop = 0.0
-            st.warning("No influential regions found by occlusion analysis")
-
-        # Convert BGR → RGB for Streamlit
-        explained_img = cv2.cvtColor(explained_img, cv2.COLOR_BGR2RGB)
+    if uploaded_doc is not None:
+        doc_image = Image.open(uploaded_doc).convert("RGB")
 
         st.image(
-            explained_img,
-            caption="Top Influential Regions (Occlusion-based XAI)",
+            doc_image,
+            caption="Uploaded Document / Screenshot",
             use_column_width=True
         )
 
-        st.write(f"**Predicted Class:** {predicted_label}")
-        st.write(f"**Prediction Confidence:** {predicted_conf:.2f}")
-        st.write(f"**Maximum Confidence Drop:** {max_drop:.2f}")
+        if st.button("🔍 Run OCR Analysis"):
+            extracted_text = extract_text(doc_image)
 
-        st.info(
-            "Occlusion-based explanation highlights regions that caused "
-            "the largest confidence drop when masked."
-        )
+            if not extracted_text.strip():
+                st.warning("No readable text detected.")
+            else:
+                st.text_area(
+                    "📝 Extracted Text",
+                    extracted_text,
+                    height=260
+                )
+
+                fields = extract_fields(extracted_text)
+
+                st.subheader("📌 Extracted Fields")
+                st.json(fields)
+
+                risk_result = calculate_risk_score(fields, extracted_text)
+
+                st.subheader("🚨 Risk Assessment")
+
+                if risk_result["risk_level"] == "Low Risk":
+                    st.success(f"✅ {risk_result['risk_level']} (Score: {risk_result['risk_score']})")
+                elif risk_result["risk_level"] == "Medium Risk":
+                    st.warning(f"⚠️ {risk_result['risk_level']} (Score: {risk_result['risk_score']})")
+                else:
+                    st.error(f"❌ {risk_result['risk_level']} (Score: {risk_result['risk_score']})")
+
+                for reason in risk_result["reasons"]:
+                    st.write(f"- {reason}")
